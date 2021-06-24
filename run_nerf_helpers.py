@@ -240,3 +240,153 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     samples = bins_g[...,0] + t * (bins_g[...,1]-bins_g[...,0])
 
     return samples
+
+
+######################
+# VIEW SPACE HELPERS #
+######################
+
+def build_M(n, f, r, t):
+    """Compute ndc projection matrix, from view space to ndc.
+    Matrix form of `ndc_rays` above.
+    Source: https://github.com/bmild/nerf/files/4451808/ndc_derivation.pdf
+    """
+    if f == np.inf:  # np doesn't do lhopitals
+        return np.array([
+            [n / r, 0, 0, 0],
+            [0, n / t, 0, 0],
+            [0, 0, -1, -2 * n],
+            [0, 0, -1, 0],
+        ])
+    return np.array([
+        [n / r, 0, 0, 0],
+        [0, n / t, 0, 0],
+        [0, 0, -(f + n) / (f - n), -2 * f * n / (f - n)],
+        [0, 0, -1, 0],
+    ])
+
+
+def to_homogenous(M):
+    return M / (M[..., -1:] + 1e-15)
+
+
+def screen_to_ndc(H, W, focal, c2w, depth):
+    """Returns ndc homogenous coordinates"""
+    rays_o, rays_d = get_rays_np(H, W, focal, c2w)
+    rays_o, rays_d = torch.Tensor(rays_o), torch.Tensor(rays_d)
+    rays_o, rays_d = ndc_rays(H, W, focal, 1., rays_o, rays_d)
+    pts1_ndc = rays_o + rays_d * depth[..., None]
+    pts1_ndc = np.concatenate([pts1_ndc, np.ones_like(pts1_ndc[..., :1])],
+                              axis=-1)
+    return pts1_ndc
+
+
+def ndc_to_world(M, ndc):
+    """Camera ndc to camera view space
+    Defining M s.t. Mv = v' with homogenous world space v and ndc v'.
+    As a result, v^T M^T = v'^T and v^T = v'^T (M^T)^-1
+    """
+    cam = ndc.dot(np.linalg.inv(M.T))
+    return cam
+
+
+def camera1_to_camera2(c2w1, c2w2, pts1_cam):  # unused
+    """Camera1 view space to camera2 view space"""
+    c2w1_h = np.vstack([c2w1, np.array([0, 0, 0, 1])])
+    c2w2_h = np.vstack([c2w2, np.array([0, 0, 0, 1])])
+    c12c2_h = c2w1_h.dot(np.linalg.inv(c2w2_h))
+    pts2_cam = np.sum(pts1_cam[..., np.newaxis, :] * c12c2_h,
+                      -1)  # dot product, equals to: [c12c2_h.dot(pt) for pt in cam]
+    pts2_cam = to_homogenous(pts2_cam)
+    return pts2_cam
+
+
+def camera_to_ndc(M, cam):  # unused
+    """Camera view space to ndc"""
+    ndc = to_homogenous(cam.dot(M.T))
+    return ndc
+
+
+def world_to_screen(cam, c2w, H, W, focal, near=1.0):
+    """Inverse of `get_rays`. Returns yx, not xy pairs.
+    To sanity check `world_to_screen`, run the following:
+
+        >>> pts1_ndc = screen_to_ndc(H, W, focal, c2w1, depth)  # cam1 screen -> cam1 ndc
+        >>> pts1_screen = world_to_screen(pts1_cam, c2w1, H, W, focal, near)
+
+    Expect to see
+
+        >>> pts1_screen[..., 0]
+        array([[  0.,   1.,   2., ..., 501., 502., 503.],
+            [  0.,   1.,   2., ..., 501., 502., 503.],
+            [  0.,   1.,   2., ..., 501., 502., 503.],
+            ...,
+            [ -0.,   1.,   2., ..., 501., 502., 503.],
+            [ -0.,   1.,   2., ..., 501., 502., 503.],
+            [ -0.,   1.,   2., ..., 501., 502., 503.]])
+        >>> pts1_screen[..., 1]
+        array([[378., 378., 378., ..., 378., 378., 378.],
+            [377., 377., 377., ..., 377., 377., 377.],
+            [376., 376., 376., ..., 376., 376., 376.],
+            ...,
+            [  3.,   3.,   3., ...,   3.,   3.,   3.],
+            [  2.,   2.,   2., ...,   2.,   2.,   2.],
+            [  1.,   1.,   1., ...,   1.,   1.,   1.]])
+    """
+    w2c = np.linalg.inv(c2w[:3, :3])
+    rays_o, _ = get_rays_np(H, W, focal, c2w)
+    rays_d = cam[..., :-1] - rays_o  # rays from pinhole to point cloud
+    dirs = np.sum(rays_d[..., np.newaxis, :] * w2c,
+                  -1)  # dot product, equals to: [w2c.dot(dir) for dir in dirs]
+    dirs = to_homogenous(dirs)
+    d0 = - dirs[..., 0] * focal + W * 0.5
+    d1 = dirs[..., 1] * focal + H * 0.5
+    screen = np.floor(np.stack([d1, d0], -1))  # NOTE: yx pairs, not xy pairs!
+    return screen.astype(int)
+
+
+def screen_to_world(depth, c2w, H, W, focal, near=1.0, far=np.inf):
+    M = build_M(near, far, W / (2.0 * focal), H / (2.0 * focal))  # proj matrix
+    ndc = screen_to_ndc(H, W, focal, c2w, depth)  # cam1 screen -> cam1 ndc
+    cam = ndc_to_world(M, ndc)  # cam1 ndc -> world
+    cam = to_homogenous(cam)
+    return cam
+
+
+def get_cam1_to_cam2_mapping(depth, c2w1, c2w2, H, W, focal, near=1.0,
+                             far=np.inf):
+    """Get mapping from all camera 1 pixels to all camera 2 pixels.
+
+    To get points in ndc for camera2, use `camera_to_ndc(M, pts2_cam)`. This is not
+    needed for the below functionality.
+    :return:
+        pts2_screen: The returned mapping is (H, W, 2). Say the top-left value, at
+                     pixel (0, 0) is (0, 1). This means (0, 0) in camera 1 is sent
+                     to pixel (0, 1) in camera 2.
+    """
+    M = build_M(near, far, W / (2.0 * focal), H / (2.0 * focal))  # proj matrix
+    pts = screen_to_world(depth, c2w1, H, W, focal, near,
+                          far)  # cam1 depth -> cam1 ndc -> world
+    screen = world_to_screen(pts, c2w2, H, W, focal,
+                             near)  # world -> cam2 screen
+    return screen
+
+
+#############
+# VISUALIZE #
+#############
+
+def visualize_point_cloud(points, colors=None):
+    assert len(points.shape) == 2 and points.shape[-1] == 3, points.shape
+    import open3d as o3d
+
+    # Pass xyz to Open3D.o3d.geometry.PointCloud and visualize
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    if colors is not None:
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+    o3d.io.write_point_cloud("tmp.ply", pcd)
+
+    # Load saved point cloud and visualize it
+    pcd_load = o3d.io.read_point_cloud("tmp.ply")
+    o3d.visualization.draw_geometries([pcd_load])
