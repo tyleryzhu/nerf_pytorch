@@ -99,7 +99,9 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
         return
     
     sh = imageio.imread(imgfiles[0]).shape
+    # adjust pose width/heights to account for factor reshape
     poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1])
+    # ???? unsure.
     poses[2, 4, :] = poses[2, 4, :] * 1./factor
     
     if not load_imgs:
